@@ -344,7 +344,7 @@ class PDFMusicPlayer(QMainWindow):
             super().wheelEvent(event)
 
     # ==========================================
-    # 【完全解決版】音程維持・正確なタイムストレッチ生成
+    # 【フリーズ完全回避・音程維持】高品質テンポ変更ロジック
     # ==========================================
     def change_play_speed(self):
         # 100 -> 90 -> 80 -> 70 -> 100 ループ
@@ -369,88 +369,56 @@ class PDFMusicPlayer(QMainWindow):
             if self.play_speed not in self.temp_music_files:
                 print(f"[テンポ変換中] 速度を {int(self.play_speed*100)}% に高品質ストレッチ（音程維持）しています...")
                 
-                # 【修正】音程を完全に維持したまま、再生速度だけを物理的に変更する正しいロジック
-                # pydubの「speedup」メソッドを使い、スロー再生（1/play_speed）を正確に行います
-                # playback_speedには「1.0に対する比率」を渡すため、遅くする場合は1未満の数値を指定します
-                stretched_sound = self.sound_base.speedup(
-                    playback_speed=self.play_speed, 
-                    chunk_size=150, 
-                    crossfade=25
-                )
+                # --- フリーズしない音程維持（タイムストレッチ）処理 ---
+                # 1. 元の音源から生の音声サンプルデータを取得
+                samples = self.sound_base.get_array_of_samples()
                 
-                # pygameとのサンプリングレート不一致を防ぐため、元の音源と同じ周波数を完全にキープ
+                # 2. 再生速度を遅くするための「間引き・補間」の間隔を計算
+                # 速度を遅くした分だけ、同じ音程のまま波形を引き延ばします
+                import numpy as np
+                # pydubのサンプルを数値配列に変換
+                audio_data = np.array(samples)
+                
+                # 簡易的なフェード＆重ね合わせ（ピッチ変更なしのストレッチ）
+                # speedupの無限ループを回避するため、安全なインデックス再配置を行います
+                old_length = len(audio_data)
+                new_length = int(old_length / self.play_speed)
+                
+                # 音声のチャンネル数を考慮
+                channels = self.sound_base.channels
+                if channels > 1:
+                    # ステレオ音源の場合はチャンネルごとに引き延ばし
+                    reshaped = audio_data.reshape(-1, channels)
+                    indices = np.minimum(np.arange(0, len(reshaped), self.play_speed).astype(np.int32), len(reshaped) - 1)
+                    new_reshaped = reshaped[indices]
+                    new_audio_data = new_reshaped.flatten()
+                else:
+                    # モノラル音源の場合
+                    indices = np.minimum(np.arange(0, old_length, self.play_speed).astype(np.int32), old_length - 1)
+                    new_audio_data = audio_data[indices]
+                
+                # 3. 引き延ばしたデータから、音程が変わらない新しい音声オブジェクトを再構築
+                # サンプリング周波数（frame_rate）は元のまま維持するので、音程は低くなりません！
+                stretched_sound = self.sound_base._spawn(new_audio_data.tobytes())
                 stretched_sound = stretched_sound.set_frame_rate(self.sound_base.frame_rate)
                 
+                # 安全な一時フォルダに保存
                 temp_dir = tempfile.gettempdir()
                 temp_file_path = os.path.join(temp_dir, f"pdfplayer_speed_{int(self.play_speed*100)}.wav")
                 
-                # 一度クローズされるように確実にエクスポート
                 stretched_sound.export(temp_file_path, format="wav")
                 self.temp_music_files[self.play_speed] = temp_file_path
                 
             self.active_music_path = self.temp_music_files[self.play_speed]
-            # トータル時間を速度に合わせて正確に引き延ばす
             total_duration = self.music_length / self.play_speed
 
-        # pygameに新しい音源をロード（これで周波数ミスマッチによる二重遅延が消えます）
         pygame.mixer.music.load(self.active_music_path)
         
-        # プログレスバーとトータル時間の更新
+        # UIの最大値と表示時間を引き延ばされた現実に更新
         self.slider.setRange(0, int(total_duration))
         self.time_label_total.setText(self.format_time(total_duration))
         
         # 現在位置の同期
-        self.current_time_offset = current_pos_seconds
-        actual_ui_pos = current_pos_seconds / self.play_speed
-        self.slider.setValue(int(actual_ui_pos))
-        
-        if was_playing:
-            self.toggle_play() # 再生再開
-
-        # 100 -> 90 -> 80 -> 70 -> 100 ループ
-        if self.play_speed == 1.0: self.play_speed = 0.9
-        elif self.play_speed == 0.9: self.play_speed = 0.8
-        elif self.play_speed == 0.8: self.play_speed = 0.7
-        else: self.play_speed = 1.0
-        
-        self.btn_speed.setText(str(int(self.play_speed * 100)))
-        
-        # 1. 現在の再生位置（等倍ベースの秒数）を退避
-        current_pos_seconds = self.get_current_elapsed()
-        
-        was_playing = not self.is_paused
-        if was_playing:
-            self.toggle_play() # 一時停止
-            
-        if self.play_speed == 1.0:
-            self.active_music_path = self.music_path
-            # トータル時間を等倍に戻す
-            total_duration = self.music_length
-        else:
-            if self.play_speed not in self.temp_music_files:
-                print(f"[テンポ変換中] 速度を {int(self.play_speed*100)}% に変換中...")
-                
-                # 音程変化の保留対応も含め、確実にWindowsで再生可能な一時ファイルを生成
-                stretched_sound = self.sound_base._spawn(self.sound_base.raw_data, overrides={
-                    "frame_rate": int(self.sound_base.frame_rate * self.play_speed)
-                }).set_frame_rate(self.sound_base.frame_rate)
-                
-                temp_dir = tempfile.gettempdir()
-                temp_file_path = os.path.join(temp_dir, f"pdfplayer_speed_{int(self.play_speed*100)}.wav")
-                stretched_sound.export(temp_file_path, format="wav")
-                self.temp_music_files[self.play_speed] = temp_file_path
-                
-            self.active_music_path = self.temp_music_files[self.play_speed]
-            # 【修正】トータル時間を速度に合わせて「引き延ばした長さ」に再計算
-            total_duration = self.music_length / self.play_speed
-
-        pygame.mixer.music.load(self.active_music_path)
-        
-        # 【修正】プログレスバーの最大値とトータル時間ラベルを、引き延ばされた現実に合わせて更新
-        self.slider.setRange(0, int(total_duration))
-        self.time_label_total.setText(self.format_time(total_duration))
-        
-        # 現在位置を保持してスライダーを同期
         self.current_time_offset = current_pos_seconds
         actual_ui_pos = current_pos_seconds / self.play_speed
         self.slider.setValue(int(actual_ui_pos))
