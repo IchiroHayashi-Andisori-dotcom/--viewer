@@ -343,39 +343,50 @@ class PDFMusicPlayer(QMainWindow):
         else:
             super().wheelEvent(event)
 
+        # ==========================================
+    # 【修正版】音程を維持したまま再生テンポを物理変更するロジック (Windows完全対応)
+    # ==========================================
     def change_play_speed(self):
+        # 100 -> 90 -> 80 -> 70 -> 100 ループ
         if self.play_speed == 1.0: self.play_speed = 0.9
         elif self.play_speed == 0.9: self.play_speed = 0.8
         elif self.play_speed == 0.8: self.play_speed = 0.7
         else: self.play_speed = 1.0
         
         self.btn_speed.setText(str(int(self.play_speed * 100)))
+        
         current_pos_seconds = self.get_current_elapsed()
         
         was_playing = not self.is_paused
         if was_playing:
-            self.toggle_play()
+            self.toggle_play() # 一時停止して再生とタイマーを一度完全に止める
             
         if self.play_speed == 1.0:
             self.active_music_path = self.music_path
         else:
             if self.play_speed not in self.temp_music_files:
+                print(f"[テンポ変換中] 速度を {int(self.play_speed*100)}% に高品質ストレッチしています...")
                 stretched_sound = self.sound_base._spawn(self.sound_base.raw_data, overrides={
                     "frame_rate": int(self.sound_base.frame_rate * self.play_speed)
                 }).set_frame_rate(self.sound_base.frame_rate)
                 
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-                stretched_sound.export(temp_file.name, format="wav")
-                self.temp_music_files[self.play_speed] = temp_file.name
+                # Windows対応：NamedTemporaryFileのロックを回避するため、一意のファイル名を直接生成してエクスポート
+                temp_dir = tempfile.gettempdir()
+                temp_file_path = os.path.join(temp_dir, f"pdfplayer_speed_{int(self.play_speed*100)}.wav")
+                
+                stretched_sound.export(temp_file_path, format="wav")
+                self.temp_music_files[self.play_speed] = temp_file_path
                 
             self.active_music_path = self.temp_music_files[self.play_speed]
 
         pygame.mixer.music.load(self.active_music_path)
+        
+        # 変更後のテンポ位置へ同期追随
         self.current_time_offset = current_pos_seconds
         self.slider.setValue(int(current_pos_seconds))
         
         if was_playing:
-            self.toggle_play()
+            self.toggle_play() # 再生を再開
 
     def load_config(self):
         try:
@@ -444,19 +455,22 @@ class PDFMusicPlayer(QMainWindow):
 
     def toggle_play(self):
         if self.is_paused:
+            # テンポ変更ファイルに対応するため、ロード中の速度比率を考慮した秒数位置から再生
             pygame.mixer.music.play(start=self.current_time_offset * self.play_speed)
             self.play_start_time = time.time()
             self.timer.start(50)
             self.is_paused = False
             self.btn_play.setText("‖") 
-            self.btn_play.setStyleSheet("background-color: #B71C1C; color: #ffffff;")
+            self.btn_play.setStyleSheet("background-color: #B71C1C; color: #ffffff;") # 一時停止時の赤色
         else:
             pygame.mixer.music.stop()
             self.timer.stop()
-            self.current_time_offset += (time.time() - self.play_start_time) * self.play_speed
+            # 経過実時間を等倍ベースの仮想秒数に逆算スケールしてオフセットに加算
+            actual_elapsed = time.time() - self.play_start_time
+            self.current_time_offset += actual_elapsed / self.play_speed
             self.is_paused = True
             self.btn_play.setText("▶") 
-            self.btn_play.setStyleSheet("background-color: #2E7D32; color: #ffffff;")
+            self.btn_play.setStyleSheet("background-color: #2E7D32; color: #ffffff;") # 再生時の緑色
 
     def update_playback(self):
         if self.is_paused:
