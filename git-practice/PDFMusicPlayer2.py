@@ -4,13 +4,12 @@ import csv
 import time
 import pymupdf
 import pygame
+from pydub import AudioSegment
+import tempfile
 from PyQt6.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QScrollArea, QPushButton, QProgressBar, QSizePolicy, QFileDialog
 from PyQt6.QtGui import QImage, QPixmap, QTransform, QPalette, QColor, QPainter, QResizeEvent, QWheelEvent, QMouseEvent, QKeyEvent
 from PyQt6.QtCore import Qt, QPoint, QTimer, pyqtSignal
 
-# ==========================================
-# テキストやアイコンを右に90度回転させるカスタムラベル
-# ==========================================
 class RotatedLabel(QLabel):
     def __init__(self, text="", parent=None):
         super().__init__(text, parent)
@@ -25,21 +24,17 @@ class RotatedLabel(QLabel):
         painter.drawText(0, 0, self.height(), self.width(), self.alignment(), self.text())
         painter.restore()
 
-# ==========================================
-# 【新規】どんな記号も確実に右に90度物理回転させる安全なカスタムボタン
-# ==========================================
 class ClickableRotatedButton(QLabel):
     clicked = pyqtSignal()
 
     def __init__(self, text="", parent=None):
         super().__init__(text, parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setCursor(Qt.CursorShape.PointingHandCursor) # マウスを乗せたら指先アイコンにする
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.save()
-        # 右に90度回転させる物理座標変換
         painter.translate(self.width(), 0)
         painter.rotate(90)
         painter.drawText(0, 0, self.height(), self.width(), self.alignment(), self.text())
@@ -47,12 +42,9 @@ class ClickableRotatedButton(QLabel):
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit() # クリック信号を発信
+            self.clicked.emit()
             event.accept()
 
-# ==========================================
-# クリック＆ドラッグでジャンプできる最大縦型進捗バー
-# ==========================================
 class ClickableReverseVerticalProgressBar(QProgressBar):
     sliderMoved = pyqtSignal(int)
 
@@ -85,16 +77,12 @@ class ClickableReverseVerticalProgressBar(QProgressBar):
             self._handle_mouse_event(event)
             event.accept()
 
-# ==========================================
-# メインのプレイヤーウィンドウ（UI構築編）
-# ==========================================
 class PDFMusicPlayer(QMainWindow):
     def __init__(self, target_dir, file_set):
         super().__init__()
         self.config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.txt")
         self.target_dir = target_dir
         
-        # 紐づけられたファイルパスの展開
         self.pdf_path = file_set["pdf"]
         self.music_path = file_set["mp3"]
         self.csv_path = file_set["csv"]
@@ -105,14 +93,16 @@ class PDFMusicPlayer(QMainWindow):
         self.current_pixmap = None
         self.is_paused = True
         
-        # デフォルト値の設定（設定ファイルがない場合用）
+        self.play_speed = 1.0
+        self.temp_music_files = {} 
+        self.active_music_path = self.music_path
+        
         self.zoom_factor = 1.0
         self.rotation_angle = 90  
         self.fit_mode = 1         
         initial_width = 1000
         initial_height = 1000
         
-        # 設定ファイル（config.txt）が存在すれば値をロードして上書き
         if os.path.exists(self.config_path):
             self.load_config()
             initial_width = self.saved_width
@@ -124,8 +114,10 @@ class PDFMusicPlayer(QMainWindow):
         self.is_resizing = False
         self.resize_edge = Qt.Edge(0)
 
+        self.sound_base = AudioSegment.from_file(self.music_path)
+        
         pygame.mixer.init()
-        pygame.mixer.music.load(self.music_path)
+        pygame.mixer.music.load(self.active_music_path)
         self.music_length = pygame.mixer.Sound(self.music_path).get_length()
         
         self.recorded_timings = {} 
@@ -140,9 +132,6 @@ class PDFMusicPlayer(QMainWindow):
         self.initUI()
         self.resize(initial_width, initial_height) 
         
-        # 修正: 画面表示前の不完全なサイズでの初期描画を廃止
-        # ウィンドウが完全に画面上に展開され、サイズが100%確定した0.1秒後に
-        # 引き継いだ正しい拡大率・フィットモードでの描画と自動再生を一括スタートさせる
         QTimer.singleShot(100, self.start_initial_playback)
 
     def initUI(self):
@@ -156,7 +145,6 @@ class PDFMusicPlayer(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         
-        # 【左側】コントロールパネル
         controls_widget = QWidget()
         controls_widget.setFixedWidth(60)
         controls_widget.setStyleSheet("""
@@ -164,7 +152,6 @@ class PDFMusicPlayer(QMainWindow):
             QPushButton { background-color: #2d2d2d; border: 1px solid #3c3c3c; border-radius: 6px; color: #ffffff; font-size: 18px; font-weight: bold; }
             QPushButton:hover { background-color: #3e3e3e; }
             QPushButton:pressed { background-color: #4f4f4f; }
-            /* 物理回転カスタムボタン専用のスタイル装飾 */
             QLabel#rotated-btn { background-color: #2d2d2d; border: 1px solid #3c3c3c; border-radius: 6px; color: #ffffff; font-size: 18px; font-weight: bold; }
             QLabel#rotated-btn:hover { background-color: #3e3e3e; }
             QPushButton.sys-btn { font-size: 14px; background-color: #252526; }
@@ -176,22 +163,23 @@ class PDFMusicPlayer(QMainWindow):
         controls_layout.setContentsMargins(0, 5, 0, 5)
         controls_layout.setSpacing(4)
         
-        # 1. 上部操作ボタンエリア
         top_menu = QWidget()
         top_layout = QVBoxLayout(top_menu)
         top_layout.setContentsMargins(5, 0, 5, 0)
         top_layout.setSpacing(6)
         
-        # 【修正】再生ボタンを確実に回転する物理回転カスタムボタンへ変更
         self.btn_play = ClickableRotatedButton("▶")
         self.btn_play.setObjectName("rotated-btn")
         self.btn_play.setFixedSize(50, 50)
-        self.btn_play.setStyleSheet("background-color: #2E7D32;") # 再生ボタンの緑色を適用
+        self.btn_play.setStyleSheet("background-color: #2E7D32;")
         
-        # 【修正】リスタートボタンを確実に回転する物理回転カスタムボタンへ変更
         self.btn_restart = ClickableRotatedButton("⏮")
         self.btn_restart.setObjectName("rotated-btn")
         self.btn_restart.setFixedSize(50, 40)
+        
+        self.btn_speed = ClickableRotatedButton("100")
+        self.btn_speed.setObjectName("rotated-btn")
+        self.btn_speed.setFixedSize(50, 40)
         
         self.btn_rewind = QPushButton("︽")
         self.btn_rewind.setFixedSize(50, 40)
@@ -209,13 +197,13 @@ class PDFMusicPlayer(QMainWindow):
         
         top_layout.addWidget(self.btn_play, 0, Qt.AlignmentFlag.AlignCenter)
         top_layout.addWidget(self.btn_restart, 0, Qt.AlignmentFlag.AlignCenter) 
+        top_layout.addWidget(self.btn_speed, 0, Qt.AlignmentFlag.AlignCenter) 
         top_layout.addWidget(self.btn_rewind, 0, Qt.AlignmentFlag.AlignCenter)
         top_layout.addWidget(self.btn_forward, 0, Qt.AlignmentFlag.AlignCenter)
         top_layout.addWidget(self.btn_rotate, 0, Qt.AlignmentFlag.AlignCenter)
         top_layout.addWidget(self.btn_fit, 0, Qt.AlignmentFlag.AlignCenter)
         controls_layout.addWidget(top_menu)
 
-        # 2. 中央スライダーエリア
         center_menu = QWidget()
         center_layout = QVBoxLayout(center_menu)
         center_layout.setContentsMargins(5, 0, 5, 0)
@@ -234,7 +222,6 @@ class PDFMusicPlayer(QMainWindow):
         center_layout.addWidget(self.time_label_total, 0, Qt.AlignmentFlag.AlignCenter)
         controls_layout.addWidget(center_menu, 1)
 
-        # 3. 最下部ウィンドウ操作エリア
         bottom_menu = QWidget()
         bottom_layout = QVBoxLayout(bottom_menu)
         bottom_layout.setContentsMargins(5, 0, 5, 0)
@@ -255,9 +242,9 @@ class PDFMusicPlayer(QMainWindow):
         bottom_layout.addWidget(self.btn_close, 0, Qt.AlignmentFlag.AlignCenter)
         controls_layout.addWidget(bottom_menu)
         
-        # イベント登録 (カスタムボタンも同じ形式で安全に紐づけ可能です)
         self.btn_play.clicked.connect(self.toggle_play)
         self.btn_restart.clicked.connect(self.reset_playback) 
+        self.btn_speed.clicked.connect(self.change_play_speed) 
         self.btn_rewind.clicked.connect(lambda: self.seek_relative(-5))
         self.btn_forward.clicked.connect(lambda: self.seek_relative(5))
         self.btn_rotate.clicked.connect(self.rotate_pdf)
@@ -269,7 +256,6 @@ class PDFMusicPlayer(QMainWindow):
         
         main_layout.addWidget(controls_widget)
         
-        # 右側楽譜表示部
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -292,9 +278,6 @@ class PDFMusicPlayer(QMainWindow):
             self.showMaximized()
             self.btn_max.setText("🗗")
 
-    # ==========================================
-    # PDFの描画およびズーム・フィッティングロジック
-    # ==========================================
     def show_page(self, page_num):
         if 0 <= page_num < self.total_pages:
             page = self.doc.load_page(page_num)
@@ -360,9 +343,40 @@ class PDFMusicPlayer(QMainWindow):
         else:
             super().wheelEvent(event)
 
-    # ==========================================
-    # 設定ファイル (config.txt) の読込・保存
-    # ==========================================
+    def change_play_speed(self):
+        if self.play_speed == 1.0: self.play_speed = 0.9
+        elif self.play_speed == 0.9: self.play_speed = 0.8
+        elif self.play_speed == 0.8: self.play_speed = 0.7
+        else: self.play_speed = 1.0
+        
+        self.btn_speed.setText(str(int(self.play_speed * 100)))
+        current_pos_seconds = self.get_current_elapsed()
+        
+        was_playing = not self.is_paused
+        if was_playing:
+            self.toggle_play()
+            
+        if self.play_speed == 1.0:
+            self.active_music_path = self.music_path
+        else:
+            if self.play_speed not in self.temp_music_files:
+                stretched_sound = self.sound_base._spawn(self.sound_base.raw_data, overrides={
+                    "frame_rate": int(self.sound_base.frame_rate * self.play_speed)
+                }).set_frame_rate(self.sound_base.frame_rate)
+                
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                stretched_sound.export(temp_file.name, format="wav")
+                self.temp_music_files[self.play_speed] = temp_file.name
+                
+            self.active_music_path = self.temp_music_files[self.play_speed]
+
+        pygame.mixer.music.load(self.active_music_path)
+        self.current_time_offset = current_pos_seconds
+        self.slider.setValue(int(current_pos_seconds))
+        
+        if was_playing:
+            self.toggle_play()
+
     def load_config(self):
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
@@ -397,9 +411,6 @@ class PDFMusicPlayer(QMainWindow):
         except Exception as e:
             print(f"設定の保存に失敗しました: {e}")
 
-    # ==========================================
-    # タイミングCSV・キーボード制御
-    # ==========================================
     def load_timings(self):
         self.recorded_timings = {}
         if os.path.exists(self.csv_path):
@@ -427,33 +438,30 @@ class PDFMusicPlayer(QMainWindow):
         secs = int(seconds) % 60
         return f"{mins:02d}:{secs:02d}"
 
-    # 【追加】起動直後のサイズ確定タイミング専用の自動再生シーケンス
     def start_initial_playback(self):
-        # 確定した正確なウィンドウ幅・高さをベースに引き継ぎ拡大率で初回レンダリング
         self.show_page(self.current_page)
-        # 即時再生を開始
         self.toggle_play()
 
     def toggle_play(self):
         if self.is_paused:
-            pygame.mixer.music.play(start=self.current_time_offset)
+            pygame.mixer.music.play(start=self.current_time_offset * self.play_speed)
             self.play_start_time = time.time()
             self.timer.start(50)
             self.is_paused = False
             self.btn_play.setText("‖") 
-            self.btn_play.setStyleSheet("background-color: #B71C1C; color: #ffffff;") # 一時停止時の赤色
+            self.btn_play.setStyleSheet("background-color: #B71C1C; color: #ffffff;")
         else:
             pygame.mixer.music.stop()
             self.timer.stop()
-            self.current_time_offset += time.time() - self.play_start_time
+            self.current_time_offset += (time.time() - self.play_start_time) * self.play_speed
             self.is_paused = True
             self.btn_play.setText("▶") 
-            self.btn_play.setStyleSheet("background-color: #2E7D32; color: #ffffff;") # 再生時の緑色
+            self.btn_play.setStyleSheet("background-color: #2E7D32; color: #ffffff;")
 
     def update_playback(self):
         if self.is_paused:
             return
-        elapsed = self.current_time_offset + (time.time() - self.play_start_time)
+        elapsed = self.current_time_offset + (time.time() - self.play_start_time) * self.play_speed
         if elapsed >= self.music_length:
             self.save_timings() 
             self.reset_playback()
@@ -465,7 +473,7 @@ class PDFMusicPlayer(QMainWindow):
     def get_current_elapsed(self):
         if self.is_paused:
             return self.current_time_offset
-        return self.current_time_offset + (time.time() - self.play_start_time)
+        return self.current_time_offset + (time.time() - self.play_start_time) * self.play_speed
 
     def sync_page_to_time(self, elapsed_time):
         appropriate_page = 0
@@ -490,7 +498,7 @@ class PDFMusicPlayer(QMainWindow):
         self.time_label_current.setText(self.format_time(target_seconds))
         self.sync_page_to_time(target_seconds)
         if not self.is_paused:
-            pygame.mixer.music.play(start=target_seconds)
+            pygame.mixer.music.play(start=target_seconds * self.play_speed)
 
     def reset_playback(self):
         pygame.mixer.music.stop()
@@ -522,6 +530,12 @@ class PDFMusicPlayer(QMainWindow):
                 self.current_page -= 1
                 self.show_page(self.current_page)
             event.accept()
+        elif key == Qt.Key.Key_Comma:
+            self.seek_relative(-5)
+            event.accept()
+        elif key == Qt.Key.Key_Period:
+            self.seek_relative(5)
+            event.accept()
         else:
             super().keyPressEvent(event)
 
@@ -530,6 +544,12 @@ class PDFMusicPlayer(QMainWindow):
         self.save_config() 
         if self.doc:
             self.doc.close()
+        for temp_path in self.temp_music_files.values():
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except:
+                pass
         super().closeEvent(event)
 
     def mousePressEvent(self, event):
@@ -566,10 +586,6 @@ class PDFMusicPlayer(QMainWindow):
         else: self.setCursor(Qt.CursorShape.ArrowCursor)
         super().mouseMoveEvent(event)
 
-
-# ==========================================
-# 実行部分（パターンA・ルール2自動検索システム搭載）
-# ==========================================
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
