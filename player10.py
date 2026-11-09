@@ -476,11 +476,11 @@ class PDFMusicPlayer(QMainWindow):
         if self.is_paused:
             return
         
-        # 1. 現在の現実の経過時間を取得
+        # 1. 現実世界で実際に経過した時間を取得
         actual_elapsed = time.time() - self.play_start_time
         
-        # 2. 【超重要】遅くなったテンポ比率で割り、100%等倍ベースの「仮想音楽秒数」に逆算変換する
-        elapsed = self.current_time_offset + (actual_elapsed / self.play_speed)
+        # 2. 【修正】現実時間に速度を「掛ける」ことで、スロー再生分だけゆっくり進む「正しい等倍ベースの音楽秒数」を計算
+        elapsed = self.current_time_offset + (actual_elapsed * self.play_speed)
         
         if elapsed >= self.music_length:
             self.save_timings() 
@@ -490,9 +490,8 @@ class PDFMusicPlayer(QMainWindow):
         self.slider.setValue(int(elapsed))
         self.time_label_current.setText(self.format_time(elapsed))
         
-        # 3. 等倍ベースに補正された秒数を渡すことで、テンポが遅くても完璧に同期してページがめくられます
+        # 3. これで、速度を遅くした分だけページめくりも現実時間上で「遅く（引き延ばされて）」発生します
         self.sync_page_to_time(elapsed)
-
 
     def get_current_elapsed(self):
         if self.is_paused:
