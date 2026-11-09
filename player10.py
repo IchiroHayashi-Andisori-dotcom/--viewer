@@ -344,7 +344,7 @@ class PDFMusicPlayer(QMainWindow):
             super().wheelEvent(event)
 
     # ==========================================
-    # 【フリーズ完全回避・音程維持】高品質テンポ変更ロジック
+    # 【完全解決版】ffmpeg直結式・フリーズなし・音程100%完全維持ロジック
     # ==========================================
     def change_play_speed(self):
         # 100 -> 90 -> 80 -> 70 -> 100 ループ
@@ -367,47 +367,34 @@ class PDFMusicPlayer(QMainWindow):
             total_duration = self.music_length
         else:
             if self.play_speed not in self.temp_music_files:
-                print(f"[テンポ変換中] 速度を {int(self.play_speed*100)}% に高品質ストレッチ（音程維持）しています...")
+                print(f"[テンポ変換中] ffmpegを使用して速度を {int(self.play_speed*100)}% に高品質ストレッチ（音程維持）しています...")
                 
-                # --- フリーズしない音程維持（タイムストレッチ）処理 ---
-                # 1. 元の音源から生の音声サンプルデータを取得
-                samples = self.sound_base.get_array_of_samples()
-                
-                # 2. 再生速度を遅くするための「間引き・補間」の間隔を計算
-                # 速度を遅くした分だけ、同じ音程のまま波形を引き延ばします
-                import numpy as np
-                # pydubのサンプルを数値配列に変換
-                audio_data = np.array(samples)
-                
-                # 簡易的なフェード＆重ね合わせ（ピッチ変更なしのストレッチ）
-                # speedupの無限ループを回避するため、安全なインデックス再配置を行います
-                old_length = len(audio_data)
-                new_length = int(old_length / self.play_speed)
-                
-                # 音声のチャンネル数を考慮
-                channels = self.sound_base.channels
-                if channels > 1:
-                    # ステレオ音源の場合はチャンネルごとに引き延ばし
-                    reshaped = audio_data.reshape(-1, channels)
-                    indices = np.minimum(np.arange(0, len(reshaped), self.play_speed).astype(np.int32), len(reshaped) - 1)
-                    new_reshaped = reshaped[indices]
-                    new_audio_data = new_reshaped.flatten()
-                else:
-                    # モノラル音源の場合
-                    indices = np.minimum(np.arange(0, old_length, self.play_speed).astype(np.int32), old_length - 1)
-                    new_audio_data = audio_data[indices]
-                
-                # 3. 引き延ばしたデータから、音程が変わらない新しい音声オブジェクトを再構築
-                # サンプリング周波数（frame_rate）は元のまま維持するので、音程は低くなりません！
-                stretched_sound = self.sound_base._spawn(new_audio_data.tobytes())
-                stretched_sound = stretched_sound.set_frame_rate(self.sound_base.frame_rate)
-                
-                # 安全な一時フォルダに保存
                 temp_dir = tempfile.gettempdir()
                 temp_file_path = os.path.join(temp_dir, f"pdfplayer_speed_{int(self.play_speed*100)}.wav")
                 
-                stretched_sound.export(temp_file_path, format="wav")
-                self.temp_music_files[self.play_speed] = temp_file_path
+                # すでに存在する古い一時ファイルがあれば削除して競合を防ぐ
+                if os.path.exists(temp_file_path):
+                    try: os.remove(temp_file_path)
+                    except: pass
+                
+                # 【超重要】ffmpegの高品質音程維持フィルター「atempo」を直接呼び出すコマンド
+                # -y は同名ファイルの上書き許可、-i は入力ファイル、-filter:a は音声フィルターの指定です
+                import subprocess
+                command = [
+                    "ffmpeg", "-y", 
+                    "-i", self.music_path, 
+                    "-filter:a", f"atempo={self.play_speed}", 
+                    temp_file_path
+                ]
+                
+                # コマンドを実行（黒い画面を出さずに裏で一瞬で処理を終わらせます）
+                try:
+                    subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                    self.temp_music_files[self.play_speed] = temp_file_path
+                except Exception as e:
+                    print(f"ffmpegによるテンポ変換に失敗しました。環境変数やパスを確認してください: {e}")
+                    # 万が一失敗した場合は等倍のパスでフォールバック
+                    self.temp_music_files[self.play_speed] = self.music_path
                 
             self.active_music_path = self.temp_music_files[self.play_speed]
             total_duration = self.music_length / self.play_speed
