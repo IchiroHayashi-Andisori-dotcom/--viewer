@@ -344,9 +344,69 @@ class PDFMusicPlayer(QMainWindow):
             super().wheelEvent(event)
 
     # ==========================================
-    # 【修正版】音程を維持したまま再生テンポを物理変更するロジック (Windows完全対応)
+    # 【完全解決版】音程維持・正確なタイムストレッチ生成
     # ==========================================
     def change_play_speed(self):
+        # 100 -> 90 -> 80 -> 70 -> 100 ループ
+        if self.play_speed == 1.0: self.play_speed = 0.9
+        elif self.play_speed == 0.9: self.play_speed = 0.8
+        elif self.play_speed == 0.8: self.play_speed = 0.7
+        else: self.play_speed = 1.0
+        
+        self.btn_speed.setText(str(int(self.play_speed * 100)))
+        
+        # 現在の再生位置（等倍ベースの秒数）を退避
+        current_pos_seconds = self.get_current_elapsed()
+        
+        was_playing = not self.is_paused
+        if was_playing:
+            self.toggle_play() # 一時停止
+            
+        if self.play_speed == 1.0:
+            self.active_music_path = self.music_path
+            total_duration = self.music_length
+        else:
+            if self.play_speed not in self.temp_music_files:
+                print(f"[テンポ変換中] 速度を {int(self.play_speed*100)}% に高品質ストレッチ（音程維持）しています...")
+                
+                # 【修正】音程を完全に維持したまま、再生速度だけを物理的に変更する正しいロジック
+                # pydubの「speedup」メソッドを使い、スロー再生（1/play_speed）を正確に行います
+                # playback_speedには「1.0に対する比率」を渡すため、遅くする場合は1未満の数値を指定します
+                stretched_sound = self.sound_base.speedup(
+                    playback_speed=self.play_speed, 
+                    chunk_size=150, 
+                    crossfade=25
+                )
+                
+                # pygameとのサンプリングレート不一致を防ぐため、元の音源と同じ周波数を完全にキープ
+                stretched_sound = stretched_sound.set_frame_rate(self.sound_base.frame_rate)
+                
+                temp_dir = tempfile.gettempdir()
+                temp_file_path = os.path.join(temp_dir, f"pdfplayer_speed_{int(self.play_speed*100)}.wav")
+                
+                # 一度クローズされるように確実にエクスポート
+                stretched_sound.export(temp_file_path, format="wav")
+                self.temp_music_files[self.play_speed] = temp_file_path
+                
+            self.active_music_path = self.temp_music_files[self.play_speed]
+            # トータル時間を速度に合わせて正確に引き延ばす
+            total_duration = self.music_length / self.play_speed
+
+        # pygameに新しい音源をロード（これで周波数ミスマッチによる二重遅延が消えます）
+        pygame.mixer.music.load(self.active_music_path)
+        
+        # プログレスバーとトータル時間の更新
+        self.slider.setRange(0, int(total_duration))
+        self.time_label_total.setText(self.format_time(total_duration))
+        
+        # 現在位置の同期
+        self.current_time_offset = current_pos_seconds
+        actual_ui_pos = current_pos_seconds / self.play_speed
+        self.slider.setValue(int(actual_ui_pos))
+        
+        if was_playing:
+            self.toggle_play() # 再生再開
+
         # 100 -> 90 -> 80 -> 70 -> 100 ループ
         if self.play_speed == 1.0: self.play_speed = 0.9
         elif self.play_speed == 0.9: self.play_speed = 0.8
@@ -397,7 +457,6 @@ class PDFMusicPlayer(QMainWindow):
         
         if was_playing:
             self.toggle_play() # 再生再開
-        
 
     def load_config(self):
         try:
