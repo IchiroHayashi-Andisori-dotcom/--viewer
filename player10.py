@@ -343,7 +343,7 @@ class PDFMusicPlayer(QMainWindow):
         else:
             super().wheelEvent(event)
 
-        # ==========================================
+    # ==========================================
     # 【修正版】音程を維持したまま再生テンポを物理変更するロジック (Windows完全対応)
     # ==========================================
     def change_play_speed(self):
@@ -355,38 +355,49 @@ class PDFMusicPlayer(QMainWindow):
         
         self.btn_speed.setText(str(int(self.play_speed * 100)))
         
+        # 1. 現在の再生位置（等倍ベースの秒数）を退避
         current_pos_seconds = self.get_current_elapsed()
         
         was_playing = not self.is_paused
         if was_playing:
-            self.toggle_play() # 一時停止して再生とタイマーを一度完全に止める
+            self.toggle_play() # 一時停止
             
         if self.play_speed == 1.0:
             self.active_music_path = self.music_path
+            # トータル時間を等倍に戻す
+            total_duration = self.music_length
         else:
             if self.play_speed not in self.temp_music_files:
-                print(f"[テンポ変換中] 速度を {int(self.play_speed*100)}% に高品質ストレッチしています...")
+                print(f"[テンポ変換中] 速度を {int(self.play_speed*100)}% に変換中...")
+                
+                # 音程変化の保留対応も含め、確実にWindowsで再生可能な一時ファイルを生成
                 stretched_sound = self.sound_base._spawn(self.sound_base.raw_data, overrides={
                     "frame_rate": int(self.sound_base.frame_rate * self.play_speed)
                 }).set_frame_rate(self.sound_base.frame_rate)
                 
-                # Windows対応：NamedTemporaryFileのロックを回避するため、一意のファイル名を直接生成してエクスポート
                 temp_dir = tempfile.gettempdir()
                 temp_file_path = os.path.join(temp_dir, f"pdfplayer_speed_{int(self.play_speed*100)}.wav")
-                
                 stretched_sound.export(temp_file_path, format="wav")
                 self.temp_music_files[self.play_speed] = temp_file_path
                 
             self.active_music_path = self.temp_music_files[self.play_speed]
+            # 【修正】トータル時間を速度に合わせて「引き延ばした長さ」に再計算
+            total_duration = self.music_length / self.play_speed
 
         pygame.mixer.music.load(self.active_music_path)
         
-        # 変更後のテンポ位置へ同期追随
+        # 【修正】プログレスバーの最大値とトータル時間ラベルを、引き延ばされた現実に合わせて更新
+        self.slider.setRange(0, int(total_duration))
+        self.time_label_total.setText(self.format_time(total_duration))
+        
+        # 現在位置を保持してスライダーを同期
         self.current_time_offset = current_pos_seconds
-        self.slider.setValue(int(current_pos_seconds))
+        actual_ui_pos = current_pos_seconds / self.play_speed
+        self.slider.setValue(int(actual_ui_pos))
         
         if was_playing:
-            self.toggle_play() # 再生を再開
+            self.toggle_play() # 再生再開
+        
 
     def load_config(self):
         try:
@@ -455,43 +466,49 @@ class PDFMusicPlayer(QMainWindow):
 
     def toggle_play(self):
         if self.is_paused:
-            # テンポ変更ファイルに対応するため、ロード中の速度比率を考慮した秒数位置から再生
-            pygame.mixer.music.play(start=self.current_time_offset * self.play_speed)
+            # 【修正】pygame.mixer.music.playのstartは「そのファイルの秒数」なので、
+            # テンポ変更ファイルに対しては、引き延ばされた現実の秒数をそのまま渡すのが正解です
+            actual_start_pos = self.current_time_offset / self.play_speed
+            pygame.mixer.music.play(start=actual_start_pos)
             self.play_start_time = time.time()
             self.timer.start(50)
             self.is_paused = False
             self.btn_play.setText("‖") 
-            self.btn_play.setStyleSheet("background-color: #B71C1C; color: #ffffff;") # 一時停止時の赤色
+            self.btn_play.setStyleSheet("background-color: #B71C1C; color: #ffffff;")
         else:
             pygame.mixer.music.stop()
             self.timer.stop()
-            # 経過実時間を等倍ベースの仮想秒数に逆算スケールしてオフセットに加算
+            # 停止時、現実の経過時間をそのまま加算
             actual_elapsed = time.time() - self.play_start_time
-            self.current_time_offset += actual_elapsed / self.play_speed
+            self.current_time_offset += actual_elapsed * self.play_speed
             self.is_paused = True
             self.btn_play.setText("▶") 
-            self.btn_play.setStyleSheet("background-color: #2E7D32; color: #ffffff;") # 再生時の緑色
+            self.btn_play.setStyleSheet("background-color: #2E7D32; color: #ffffff;")
 
     def update_playback(self):
         if self.is_paused:
             return
         
-        # 1. 現実世界で実際に経過した時間を取得
+        # 現実世界での純粋な経過時間
         actual_elapsed = time.time() - self.play_start_time
         
-        # 2. 【修正】現実時間に速度を「掛ける」ことで、スロー再生分だけゆっくり進む「正しい等倍ベースの音楽秒数」を計算
-        elapsed = self.current_time_offset + (actual_elapsed * self.play_speed)
+        # 1. プログレスバーの現在位置（現実の時間軸）
+        current_actual_time = (self.current_time_offset / self.play_speed) + actual_elapsed
         
-        if elapsed >= self.music_length:
+        # 2. 楽曲が最後まで引き延ばされた時間に達したかチェック（途中で終わるバグの解消）
+        extended_total_length = self.music_length / self.play_speed
+        if current_actual_time >= extended_total_length:
             self.save_timings() 
             self.reset_playback()
             return
             
-        self.slider.setValue(int(elapsed))
-        self.time_label_current.setText(self.format_time(elapsed))
+        self.slider.setValue(int(current_actual_time))
+        self.time_label_current.setText(self.format_time(current_actual_time))
         
-        # 3. これで、速度を遅くした分だけページめくりも現実時間上で「遅く（引き延ばされて）」発生します
-        self.sync_page_to_time(elapsed)
+        # 3. 【超重要】ページめくり判定（sync_page_to_time）には、
+        # 速度を掛け算して「元の100%等倍の音楽時間」に直した秒数を渡すことで、完璧に音と連動させます
+        music_elapsed_seconds = current_actual_time * self.play_speed
+        self.sync_page_to_time(music_elapsed_seconds)
 
     def get_current_elapsed(self):
         if self.is_paused:
