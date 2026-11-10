@@ -1,4 +1,4 @@
-import sys# 修正再開
+import sys# 修正再開# 修正再開
 import os
 import csv
 import time
