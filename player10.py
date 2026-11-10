@@ -1,5 +1,4 @@
-###########この行を追加しました###########
-import sys
+import sys# 修正再開
 import os
 import csv
 import time
